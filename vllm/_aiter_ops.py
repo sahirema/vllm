@@ -825,9 +825,41 @@ def _rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl(
 
     assert quant_dtype in [torch.int8, FP8_DTYPE]
 
+    # This op is tagged ``flexible_layout``, so Inductor may pass a
+    # non-contiguous tensor instead of materializing a copy. The AITER kernel
+    # honours an arbitrary *row pitch* -- it reads ``.stride(0)`` for each
+    # tensor and addresses rows as ``idx * stride(0)`` -- but it never reads
+    # ``.stride(-1)``, so it silently assumes the innermost stride is 1
+    # (aiter ``csrc/kernels/rmsnorm_quant_kernels.cu``). Guard on
+    # ``stride(-1)`` and not ``is_contiguous()``: accepting a padded row stride
+    # from the producing GEMM is exactly what the tag is for, and demanding
+    # full contiguity would reintroduce the copy the tag removes.
+    #
+    # The rank check is part of the same contract: the kernel takes
+    # ``n = input.size(1)`` and ``m = input.numel() / n``, then walks all ``m``
+    # rows at a single ``stride(0)`` pitch, which is only meaningful for a 2-D
+    # input. Callers flatten before reaching here. Raise rather than assert so
+    # the guard survives ``python -O``: a higher-rank input is not caught by
+    # the kernel, it is walked at the wrong pitch and returns wrong numbers,
+    # which is the same silent-corruption failure mode the stride guards above
+    # exist to prevent -- and the mode that made #53850 a bug rather than a
+    # crash. The ``quant_dtype`` assert above is left as an assert because it
+    # is an internal invariant that fails loudly either way.
+    if x.dim() != 2:
+        raise ValueError(f"expected a 2-D input, got shape {tuple(x.shape)}")
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if residual.stride(-1) != 1:
+        residual = residual.contiguous()
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+
     y_scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
     out = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
-    residual_out = torch.empty_like(x)
+    # Explicitly contiguous rather than ``empty_like``: under the tag ``x`` can
+    # carry a padded row pitch, and ``preserve_format`` would propagate that
+    # layout into the residual stream every subsequent decoder layer reads.
+    residual_out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
     rocm_aiter.rmsnorm2d_fwd_with_add_dynamicquant(
         out,
@@ -852,7 +884,9 @@ def _rocm_aiter_rmsnorm_fused_add_dynamic_quant_fake(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     y_scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
     out = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
-    residual_out = torch.empty_like(x)
+    # Must match the real impl's explicitly-contiguous allocation so the
+    # traced meta layout agrees with what runs.
+    residual_out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
     return out, residual_out, y_scale
 
@@ -2223,6 +2257,14 @@ class rocm_aiter_ops:
                 op_func=_rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl,
                 fake_impl=_rocm_aiter_rmsnorm_fused_add_dynamic_quant_fake,
                 dispatch_key=current_platform.dispatch_key,
+                # The kernel consumes strides rather than requiring a canonical
+                # layout, so Inductor does not need to materialize the producing
+                # GEMM's output into contiguous form. Same rationale as the
+                # ``unified_mla_attention_with_output`` registration in
+                # ``model_executor/layers/attention/mla_attention.py``. The impl
+                # guards the one part of the contract the kernel does not
+                # express through strides; see the comment there.
+                tags=(torch.Tag.flexible_layout,),
             )
 
             direct_register_custom_op(

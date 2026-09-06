@@ -444,6 +444,161 @@ def test_rocm_aiter_rmsnorm_fused_add_dynamic_quant_vs_reference():
     )
 
 
+def _fused_add_dynamic_quant(x, residual, weight, eps, quant_dtype):
+    return torch.ops.vllm.rocm_aiter_rmsnorm_fused_add_dynamic_quant(
+        x, residual, weight, eps, quant_dtype
+    )
+
+
+def test_rocm_aiter_rmsnorm_fused_add_dynamic_quant_padded_row_stride(monkeypatch):
+    """A padded row pitch with unit innermost stride matches contiguous inputs.
+
+    This is the layout the ``flexible_layout`` tag exists to accept, and the
+    one Inductor may now hand the op in place of a copy: ``stride(-1) == 1``
+    but ``stride(0) > N``. The AITER kernel reads ``stride(0)`` directly, so
+    the guards in the impl must let this through without copying.
+
+    Numerics alone cannot test that: a copy produces the same numbers, so a
+    regression that reintroduced an unconditional ``.contiguous()`` would pass
+    every value assertion below. The no-copy property is the whole point of the
+    tag, so it is checked directly, by capturing the tensor the kernel actually
+    receives and confirming it is the caller's storage at the caller's pitch.
+    """
+    require_aiter()
+    require_fp8()
+
+    M, N, PAD = 16, 256, 64
+    eps = 1e-5
+    fp8_dtype = current_platform.fp8_dtype()
+
+    x_view = torch.randn(M, N + PAD, dtype=torch.bfloat16)[:, :N]
+    res_view = torch.randn(M, N + PAD, dtype=torch.bfloat16)[:, :N]
+    assert not x_view.is_contiguous()
+    assert x_view.stride(-1) == 1 and x_view.stride(0) == N + PAD
+    # A learned scale, not ones: a uniform weight makes a misread of the weight
+    # buffer observationally identical to a correct read, which would leave the
+    # third guard unconstrained. Matches the ``# learned scale`` weights used
+    # elsewhere in this file.
+    weight = torch.randn(N, dtype=torch.bfloat16)
+
+    # The impl does ``import aiter`` inside the function, so it resolves the
+    # entry point through ``sys.modules`` on every call and patching the module
+    # attribute is enough. Positions 1, 2 and 5 are ``x``, ``residual`` and
+    # ``weight``; see the call in
+    # ``_rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl``.
+    import aiter
+
+    real_fn = aiter.rmsnorm2d_fwd_with_add_dynamicquant
+    received = []
+
+    def _spy(*args, **kwargs):
+        received.append((args[1], args[2], args[5]))
+        return real_fn(*args, **kwargs)
+
+    monkeypatch.setattr(aiter, "rmsnorm2d_fwd_with_add_dynamicquant", _spy)
+
+    q_s, res_s, scale_s = _fused_add_dynamic_quant(
+        x_view, res_view, weight, eps, fp8_dtype
+    )
+
+    got_x, got_res, got_w = received[0]
+    assert got_w.data_ptr() == weight.data_ptr(), "contiguous weight was copied"
+    assert got_x.data_ptr() == x_view.data_ptr(), (
+        "input was copied before reaching the kernel; the flexible_layout tag "
+        "exists precisely to avoid that copy"
+    )
+    assert got_res.data_ptr() == res_view.data_ptr(), "residual was copied"
+    assert got_x.stride(0) == N + PAD and got_res.stride(0) == N + PAD, (
+        f"row pitch not preserved: got {got_x.stride(0)}, want {N + PAD}"
+    )
+    q_c, res_c, scale_c = _fused_add_dynamic_quant(
+        x_view.contiguous(), res_view.contiguous(), weight, eps, fp8_dtype
+    )
+
+    # The residual stream must stay contiguous regardless of the input layout.
+    assert res_s.is_contiguous()
+    q_ulp = int(fp8_ulp_distance(q_s, q_c).max().item())
+    assert q_ulp <= 1, f"padded-stride quant: max fp8 ULP {q_ulp} > 1"
+    res_ulp = int(bf16_ulp_distance(res_s, res_c).max().item())
+    assert res_ulp <= 1, f"padded-stride residual: max bf16 ULP {res_ulp} > 1"
+    torch.testing.assert_close(scale_s, scale_c)
+
+
+def test_rocm_aiter_rmsnorm_fused_add_dynamic_quant_non_unit_stride_fallback(
+    monkeypatch,
+):
+    """Inputs with a non-unit innermost stride fall back to a copy.
+
+    The kernel never reads ``.stride(-1)``; it assumes 1. Under
+    ``flexible_layout`` Inductor is free to pass a transposed or strided view,
+    which would otherwise be read as physically-contiguous memory that no
+    longer corresponds to logically-adjacent hidden-dim elements -- wrong
+    numbers, no crash. All three guarded inputs are strided here, and all
+    three are checked both ways -- see the note on the weight below, which is
+    the one that is easy to leave uncovered by accident.
+
+    The value assertions are the discriminating ones -- without the guards this
+    test fails, measured -- but they cannot distinguish "the guard copied" from
+    "the kernel happened to agree". The spy closes that, and is also the
+    negative control for the padded-stride test above: the same ``data_ptr``
+    comparison that must show *no* copy there must show a copy here, which is
+    what makes it capable of detecting one.
+    """
+    require_aiter()
+    require_fp8()
+
+    M, N = 16, 256
+    eps = 1e-5
+    fp8_dtype = current_platform.fp8_dtype()
+
+    x_t = torch.randn(N, M, dtype=torch.bfloat16).t()
+    res_t = torch.randn(N, M, dtype=torch.bfloat16).t()
+    # randn, not ones: with an all-ones buffer the unguarded misread (the first
+    # N of 2N elements) and the guarded read (the logical N) are both all ones,
+    # so the value assertions below could not see the weight guard at all.
+    weight_strided = torch.randn(2 * N, dtype=torch.bfloat16)[::2]
+    assert x_t.stride(-1) == M and res_t.stride(-1) == M
+    assert weight_strided.stride(-1) == 2
+
+    import aiter
+
+    real_fn = aiter.rmsnorm2d_fwd_with_add_dynamicquant
+    received = []
+
+    def _spy(*args, **kwargs):
+        received.append((args[1], args[2], args[5]))
+        return real_fn(*args, **kwargs)
+
+    monkeypatch.setattr(aiter, "rmsnorm2d_fwd_with_add_dynamicquant", _spy)
+
+    q_s, res_s, scale_s = _fused_add_dynamic_quant(
+        x_t, res_t, weight_strided, eps, fp8_dtype
+    )
+
+    got_x, got_res, got_w = received[0]
+    assert got_x.data_ptr() != x_t.data_ptr(), (
+        "a non-unit innermost stride reached the kernel uncopied; it would be "
+        "read as physically contiguous and return wrong numbers"
+    )
+    assert got_res.data_ptr() != res_t.data_ptr(), "strided residual not copied"
+    assert got_w.data_ptr() != weight_strided.data_ptr(), "strided weight not copied"
+    assert got_x.stride(-1) == 1 and got_res.stride(-1) == 1
+    assert got_w.stride(-1) == 1
+    q_c, res_c, scale_c = _fused_add_dynamic_quant(
+        x_t.contiguous(),
+        res_t.contiguous(),
+        weight_strided.contiguous(),
+        eps,
+        fp8_dtype,
+    )
+
+    q_ulp = int(fp8_ulp_distance(q_s, q_c).max().item())
+    assert q_ulp <= 1, f"fallback quant: max fp8 ULP {q_ulp} > 1"
+    res_ulp = int(bf16_ulp_distance(res_s, res_c).max().item())
+    assert res_ulp <= 1, f"fallback residual: max bf16 ULP {res_ulp} > 1"
+    torch.testing.assert_close(scale_s, scale_c)
+
+
 def test_rocm_aiter_rmsnorm_fp8_group_quant_vs_sequential():
     """Fused RMSNorm+FP8-group-quant matches sequential rms_norm->group_fp8_quant.
 
