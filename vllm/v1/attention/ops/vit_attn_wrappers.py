@@ -82,9 +82,13 @@ def _varlen_attn_pad_long_segments(
 
     spans = list(zip(bounds[:-1], bounds[1:]))
     short_spans = [(s, e) for s, e in spans if e - s < _VIT_PAD_MIN_SEQLEN]
-    # Recomputed from the spans rather than threaded down from `max_seqlen`, which
-    # is equal to it only by way of an invariant the caller enforces. Deriving it
-    # here keeps this helper correct on its own arguments.
+    # Recomputed from the spans rather than threaded down from `max_seqlen`, so this
+    # stays correct if a caller passes a batch-wide `max_seqlen`.
+    # Precondition: callers gate on `max_seqlen >= _VIT_PAD_MIN_SEQLEN`. Below that this
+    # helper is not merely suboptimal but wrong to enter at one segment: a solo span
+    # shorter than the constant has a non-empty `short_spans`, so it takes the split+pad
+    # leg to separate a short segment from long ones that do not exist, and measures
+    # slower than not acting at all.
     max_span = max(e - s for s, e in spans)
 
     if not short_spans:
