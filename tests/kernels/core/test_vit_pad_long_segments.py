@@ -228,3 +228,94 @@ def test_below_threshold_matches_the_unpartitioned_kernel():
         window_size=(-1, -1),
     )
     torch.testing.assert_close(got.squeeze(0), want, rtol=0, atol=0)
+
+
+# `cu_seqlens` does not always end at the last real segment. For encoder CUDA graph
+# capture `prepare_encoder_metadata` pads it up to a fixed sequence count by repeating
+# the final offset, so the tail of the batch is zero-length segments. They address no
+# rows, which is exactly why no output value can witness them -- but classified as
+# "short" they make `short_spans` non-empty on every captured batch, which forces the
+# split+pad leg onto shapes that must not take it. The launch plan is the observable.
+ZERO_PAD_COUNTS = [pytest.param(1, id="one_empty"), pytest.param(5, id="five_empty")]
+
+
+@pytest.mark.parametrize("segments", SEGMENTS)
+@pytest.mark.parametrize("n_empty", ZERO_PAD_COUNTS)
+def test_trailing_empty_segments_do_not_change_the_launch_plan(
+    segments, n_empty, monkeypatch
+):
+    """Graph-capture padding must be inert, in the launch plan and in the values.
+
+    Without the filter this fails on `all_long` and `single_long_no_short_group` --
+    the two shapes whose whole point is *not* to split -- and it fails silently:
+    `torch.cat` over empty aranges yields an empty index, so the extra shorts call
+    writes nothing and every value still matches. Asserting the plan is what makes
+    the regression visible; asserting the values is what keeps the filter honest.
+    """
+    monkeypatch.setattr(vit_attn_wrappers, "_VIT_PAD_MIN_SEQLEN", THRESHOLD)
+    scale = HEAD_DIM**-0.5
+    q, k, v, cu_seqlens = _make_inputs(segments)
+    # Same totals, so `_make_inputs` returns the same q/k/v and the two runs are
+    # comparable tensor-for-tensor rather than only distributionally.
+    _, _, _, padded_cu_seqlens = _make_inputs([*segments, *([0] * n_empty)])
+
+    plain_launches: list[int] = []
+    padded_launches: list[int] = []
+    plain = _varlen_attn_pad_long_segments(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        scale,
+        _spy(_reference_varlen, plain_launches),
+        {},
+        PADDED_HEAD_DIM,
+    )
+    padded = _varlen_attn_pad_long_segments(
+        q,
+        k,
+        v,
+        padded_cu_seqlens,
+        scale,
+        _spy(_reference_varlen, padded_launches),
+        {},
+        PADDED_HEAD_DIM,
+    )
+
+    assert (
+        sorted(padded_launches, reverse=True)
+        == EXPECTED_LAUNCH_HEAD_DIMS[tuple(segments)]
+    ), f"{n_empty} empty segments changed the plan for {segments}: {padded_launches}"
+    assert sorted(padded_launches) == sorted(plain_launches)
+    torch.testing.assert_close(padded, plain, rtol=0, atol=0)
+
+
+def test_all_empty_segments_return_without_launching_a_kernel(monkeypatch):
+    """An entirely empty batch must not reach the span arithmetic or the kernel.
+
+    The gate only enters the helper once `max_seqlen` reaches the threshold, and a
+    caller may pass a `max_seqlen` that is not derived from these bounds (the Qwen3-VL
+    encoder passes an override during capture), so this shape is not provably
+    unreachable -- and `max()` over no spans raises rather than degrading. Asserting
+    on zero launches rather than one pins the part that matters: no kernel is handed
+    a `max_seqlen` of zero, which is a value no other path through this helper
+    produces and so a value no other test covers.
+    """
+    monkeypatch.setattr(vit_attn_wrappers, "_VIT_PAD_MIN_SEQLEN", THRESHOLD)
+    cu_seqlens = torch.zeros(4, dtype=torch.int32)
+    q = torch.zeros(0, NUM_HEADS, HEAD_DIM)
+
+    launches: list[int] = []
+    out = _varlen_attn_pad_long_segments(
+        q,
+        q,
+        q,
+        cu_seqlens,
+        HEAD_DIM**-0.5,
+        _spy(_reference_varlen, launches),
+        {},
+        PADDED_HEAD_DIM,
+    )
+
+    assert launches == [], "an empty batch must not reach the varlen kernel at all"
+    assert out.shape == q.shape

@@ -80,7 +80,25 @@ def _varlen_attn_pad_long_segments(
         padded[..., :head_dim] = x
         return padded
 
-    spans = list(zip(bounds[:-1], bounds[1:]))
+    # Zero-length spans are dropped rather than classified. `cu_seqlens` is padded
+    # up to a fixed sequence count for encoder CUDA graph capture by repeating the
+    # final offset (`prepare_encoder_metadata` in the Qwen3-VL model), and every
+    # repeat arrives here as an empty span. Left in, each would count as "short",
+    # which makes `short_spans` non-empty on every captured batch and so makes the
+    # all-long check below permanently false -- forcing split+pad onto exactly the
+    # uniform shape that check exists to hand back to the plain call.
+    spans = [(s, e) for s, e in zip(bounds[:-1], bounds[1:]) if e > s]
+    if not spans:
+        # No tokens to attend over, and the answer needs no kernel to find:
+        # `cu_seqlens` begins at zero, so every bound being equal means every
+        # bound is zero and `q` is empty. Not reachable through the gate, which
+        # only enters here once some segment reaches the threshold, but a caller
+        # may gate on an overridden `max_seqlen` that is not derived from these
+        # bounds, and `max_span` below would then raise on an empty sequence.
+        # Returning directly rather than forwarding to `varlen_fn` keeps this
+        # from being the one path that hands the kernel a `max_seqlen` of zero --
+        # a value no other path here produces, and so one nothing exercises.
+        return torch.zeros_like(q)
     short_spans = [(s, e) for s, e in spans if e - s < _VIT_PAD_MIN_SEQLEN]
     # Recomputed from the spans rather than threaded down from `max_seqlen`, so this
     # stays correct if a caller passes a batch-wide `max_seqlen`.
@@ -136,7 +154,9 @@ def _varlen_attn_pad_long_segments(
 
     # Uninitialised is safe because the two writes below partition `spans` exactly:
     # every span is either at or above the threshold (written by the loop) or below it
-    # (written via `index`), so no row of `out` is left unset.
+    # (written via `index`), so no row of `out` is left unset. `spans` holds only
+    # non-empty spans, and the dropped empty ones address no rows, so every row of `q`
+    # still falls in exactly one span.
     out = torch.empty_like(q)
     for start, end in spans:
         seg_len = end - start
